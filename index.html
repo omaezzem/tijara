@@ -1075,7 +1075,7 @@ async function glide(pi,from,steps){
   const at=(p,extra='')=>`translate(${p.x}px,${p.y}px) translate(-50%,-78%) ${extra}`;
   let pos=from,cur=cellCenter(from);
   fly.style.transform=at(cur);
-  if(reduce){fly.remove();return}
+  if(reduce||document.hidden){fly.remove();return}
   for(let k=0;k<steps;k++){
     const next=(pos+1)%40,nc=cellCenter(next),mid={x:(cur.x+nc.x)/2,y:(cur.y+nc.y)/2};
     const last=k===steps-1;
@@ -1085,17 +1085,21 @@ async function glide(pi,from,steps){
       {transform:at(nc,last?'scale(1.12,0.88)':'')},
       ...(last?[{transform:at(nc,'scale(0.96,1.04)'),offset:.85},{transform:at(nc)}]:[])
     ],{duration:last?300:175,easing:'ease-in-out',fill:'forwards'});
-    await anim.finished.catch(()=>{});
+    // never wait forever: hidden tabs pause animations
+    await Promise.race([anim.finished.catch(()=>{}),new Promise(r=>setTimeout(r,(last?300:175)+120))]);
+    if(document.hidden){break}
     pos=next;cur=nc;sfx('step');
   }
   await new Promise(r=>setTimeout(r,60));
   fly.remove();
 }
 
+let animStart=0;
 function playAnim(d,pi,from,move,done){
-  animating=true;
+  animating=true;animStart=Date.now();
   const fin=()=>{animating=false;if(done)done();else if(pending){S=pending;pending=null;render()}};
   const dice=$('dice');if(!dice)return fin();
+  if(document.hidden){const dbl=d[0]===d[1];dice.querySelectorAll('.cube').forEach((c,k)=>{c.style.transform=`rotateX(-16deg) rotateY(-24deg) ${CUBE[d[k]]}`;c.parentNode.classList.toggle('dbl',dbl)});return fin()}
   dice.classList.add('rolling');let n=0;sfx('roll');
   const cubes=[...dice.querySelectorAll('.cube')];
   const spin=()=>cubes.forEach(c=>{c.style.transform=`rotateX(${Math.floor(Math.random()*8-4)*90+Math.random()*40}deg) rotateY(${Math.floor(Math.random()*8-4)*90+Math.random()*40}deg) rotateZ(${Math.random()*90-45}deg)`});
@@ -1321,7 +1325,8 @@ function onGuestData(m){
     const turnChanged=!S||S.turn!==m.S.turn;
     if(turnChanged)localSel=null;
     $('setup').hidden=true;
-    if(animating)pending=m.S;else{S=m.S;render()}
+    if(animating&&Date.now()-animStart>7000){animating=false;busy=false;$('board').querySelectorAll('.flyer').forEach(x=>x.remove())}
+    if(animating)pending=m.S;else{S=m.S;pending=null;render()}
     if(turnChanged&&NET.seat===m.S.turn&&m.S.winner==null){toast('Nobtek! 🎲');try{navigator.vibrate&&navigator.vibrate([60,40,60])}catch(e){}}
   }
   else if(m.type==='anim'&&S&&Array.isArray(m.d)){busy=true;playAnim(m.d,m.pi,m.from,!!m.move,()=>{busy=false;if(pending){S=pending;pending=null;render()}})}
@@ -1369,6 +1374,9 @@ function send(act,arg,seat){
   if(NET&&NET.role==='guest'){if(!busy&&NET.conn&&NET.conn.open)NET.conn.send({type:'act',act,i:arg});return}
   perform(act,arg,NET?NET.seat:seat);
 }
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden&&animating&&Date.now()-animStart>7000){animating=false;busy=false;if(pending){S=pending;pending=null}if(S)render()}
+});
 let finishArmed=0;
 document.addEventListener('click',e=>{
   const r=e.target.closest('[data-react]');if(r){sendReact(r.dataset.react);return}
