@@ -323,7 +323,7 @@ details li{margin-bottom:6px}details li b{color:var(--txt)}
   <radialGradient id="tjShine" cx=".35" cy=".28" r=".75"><stop offset="0" stop-color="#fff" stop-opacity=".55"/><stop offset=".45" stop-color="#fff" stop-opacity=".08"/><stop offset="1" stop-color="#000" stop-opacity=".25"/></radialGradient>
 </defs></svg>
 
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script>
 {
 /* ================= data ================= */
@@ -902,8 +902,71 @@ function perform(act,i,seat){
   render();
 }
 
-/* ================= online (PeerJS, peer-to-peer) ================= */
-const PREFIX='tijara-lbled-v1-';
+/* ================= online transport: MQTT relay (works on any network, 4G included) =================
+   A tiny Peer/Connection shim with the same shape the game used before (PeerJS-like),
+   but every message goes through a public MQTT broker over secure WebSocket. */
+const BROKERS=['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt','wss://test.mosquitto.org:8081/mqtt'];
+const TP='tijara-lbled/v2/';
+const rid=()=>Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4);
+class RConn{
+  constructor(peer,remote,cid){this.p=peer;this.peer=remote;this.cid=cid;this.open=false;this.h={}}
+  on(e,f){(this.h[e]=this.h[e]||[]).push(f);return this}
+  emit(e,...a){(this.h[e]||[]).forEach(f=>{try{f(...a)}catch(x){console.error(x)}})}
+  send(m){this.p._pub(this.peer,{k:'d',from:this.p.id,cid:this.cid,m})}
+}
+class RPeer{
+  constructor(id,opts={}){
+    this.id=id||('g'+rid());this.h={};this.conns={};this.dead=false;
+    const url=BROKERS[opts.broker||0];
+    const will=opts.will?{topic:TP+'in/'+opts.will,payload:JSON.stringify({k:'gone',from:this.id}),qos:1}:undefined;
+    try{
+      this.c=mqtt.connect(url,{clientId:'tj_'+rid(),clean:true,keepalive:20,reconnectPeriod:2000,connectTimeout:8000,will});
+    }catch(e){setTimeout(()=>this.emit('error',{type:'network'}),0);return}
+    let opened=false;
+    this.c.on('connect',()=>{
+      this.c.subscribe(TP+'in/'+this.id,{qos:1},err=>{
+        if(err){this.emit('error',{type:'network'});return}
+        if(!opened){opened=true;this.emit('open',this.id)}
+      });
+    });
+    this.c.on('message',(t,buf)=>{let d;try{d=JSON.parse(buf.toString())}catch(e){return}this._in(d)});
+    this.c.on('error',()=>{if(!opened)this.emit('error',{type:'network'})});
+    this._failT=setTimeout(()=>{if(!opened)this.emit('error',{type:'network'})},12000);
+  }
+  on(e,f){(this.h[e]=this.h[e]||[]).push(f);return this}
+  emit(e,...a){(this.h[e]||[]).forEach(f=>{try{f(...a)}catch(x){console.error(x)}})}
+  _pub(to,obj){if(this.c&&!this.dead)this.c.publish(TP+'in/'+to,JSON.stringify(obj),{qos:1})}
+  _in(d){
+    if(!d||typeof d!=='object')return;
+    if(d.k==='syn'){ // someone wants to connect to me
+      let c=this.conns[d.cid];
+      if(!c){c=new RConn(this,String(d.from),d.cid);this.conns[d.cid]=c;c.open=true;this.emit('connection',c);
+        setTimeout(()=>c.emit('open'),0)}
+      this._pub(d.from,{k:'ack',cid:d.cid});return;
+    }
+    if(d.k==='ack'){const c=this.conns[d.cid];if(c&&!c.open){c.open=true;clearTimeout(c._t);c.emit('open')}return}
+    if(d.k==='d'){const c=this.conns[d.cid];if(c&&c.open)c.emit('data',d.m);return}
+    if(d.k==='fin'||d.k==='gone'){
+      for(const k in this.conns){const c=this.conns[k];if(c.peer===d.from&&(d.k==='gone'||k===d.cid)&&c.open){c.open=false;c.emit('close');delete this.conns[k]}}
+    }
+  }
+  connect(remote){
+    const cid=rid(),c=new RConn(this,remote,cid);this.conns[cid]=c;
+    const syn=()=>this._pub(remote,{k:'syn',from:this.id,cid});
+    syn();const again=setInterval(()=>{if(c.open||this.dead)clearInterval(again);else syn()},1500);
+    c._t=setTimeout(()=>{clearInterval(again);if(!c.open)this.emit('error',{type:'peer-unavailable'})},9000);
+    return c;
+  }
+  destroy(){
+    if(this.dead)return;
+    for(const k in this.conns){const c=this.conns[k];if(c.open)this._pub(c.peer,{k:'fin',from:this.id,cid:k})}
+    this.dead=true;clearTimeout(this._failT);
+    try{this.c&&this.c.end(false)}catch(e){}
+  }
+}
+
+/* ================= online rooms ================= */
+const PREFIX='room-';
 const genCode=()=>Array.from({length:5},()=>'ABCDEFGHJKMNPQRSTUVWXYZ23456789'[Math.floor(Math.random()*31)]).join('');
 const netMsg=t=>{$('netMsg').textContent=t};
 let toastT;
@@ -916,13 +979,14 @@ function renderHostLobby(){
   $('startOnline').disabled=NET.lobby.length<2;
   broadcast({type:'lobby',names:NET.lobby.map(l=>l.name)});
 }
-function noPeer(){if(typeof Peer==='undefined'){netMsg("Ma qdrtch nchargé l'online. Tchecki l'internet o 3awd 7ell l'page.");return true}return false}
+function noPeer(){if(typeof mqtt==='undefined'){netMsg("Ma qdrtch nchargé l'online. Tchecki l'internet o 3awd 7ell l'page.");return true}return false}
 function hostRoom(){
   if(noPeer())return;
   leaveNet();
-  const name=$('hName').value.trim()||'Host',code=genCode();
+  const name=$('hName').value.trim()||'Host';
+  const bi=hostRoom.bi||0,code=genCode().slice(0,4)+(bi+1);
   netMsg('Kancrée l\'room…');
-  const peer=new Peer(PREFIX+code);
+  const peer=new RPeer(PREFIX+code,{broker:bi});
   NET={role:'host',peer,code,conns:[],lobby:[{name,id:'host'}],seat:0,started:false};
   peer.on('open',()=>{
     $('hostForm').hidden=true;$('hostRoom').hidden=false;$('codeTxt').textContent=code;
@@ -930,8 +994,11 @@ function hostRoom(){
     netMsg('Sift l\'code l drari. Mlli ydkhlo, brek "Bda l\'game".');renderHostLobby();
   });
   peer.on('error',e=>{
-    if(e.type==='unavailable-id'){hostRoom();return}
-    netMsg('Mochkil f l\'connexion ('+e.type+'). 3awd jerreb.');
+    if(NET&&NET.peer===peer&&!NET.started&&$('hostRoom').hidden){
+      if((hostRoom.bi||0)<BROKERS.length-1){hostRoom.bi=(hostRoom.bi||0)+1;peer.destroy();hostRoom();return}
+      hostRoom.bi=0;
+    }
+    netMsg('Mochkil f l\'connexion ('+e.type+'). Tchecki l\'internet o 3awd jerreb.');
   });
   peer.on('connection',conn=>{
     conn.on('data',m=>onHostData(conn,m));
@@ -979,9 +1046,10 @@ function joinRoom(){
   if(noPeer())return;
   const name=$('jName').value.trim().slice(0,14),code=$('jCode').value.trim().toUpperCase();
   if(!name){netMsg('Kteb smitek.');return}
-  if(code.length!==5){netMsg('L\'code fih 5 dl 7rouf.');return}
+  if(code.length!==5||!/[1-9]$/.test(code)){netMsg('L\'code fih 5 dl 7rouf, o kayssali b ra9m.');return}
   leaveNet();netMsg('Kandkhol…');
-  const peer=new Peer();
+  const bi=Math.min(BROKERS.length-1,+code.slice(-1)-1);
+  const peer=new RPeer(null,{broker:bi,will:PREFIX+code});
   NET={role:'guest',peer,seat:null,code};
   peer.on('open',()=>{
     const conn=peer.connect(PREFIX+code,{reliable:true});
